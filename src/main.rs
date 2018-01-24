@@ -6,7 +6,6 @@ extern crate chrono;
 #[macro_use]
 extern crate clap;
 extern crate ctrlc;
-extern crate elf;
 extern crate env_logger;
 #[macro_use]
 extern crate failure;
@@ -19,7 +18,10 @@ extern crate read_process_memory;
 #[cfg(test)]
 extern crate rbspy_testdata;
 extern crate rand;
+#[cfg(target_os = "linux")]
+extern crate elf;
 #[cfg(target_os = "macos")]
+extern crate goblin;
 extern crate regex;
 extern crate ruby_bindings as bindings;
 #[cfg(test)]

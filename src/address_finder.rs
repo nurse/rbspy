@@ -19,15 +19,50 @@ pub enum AddressFinderError {
 
 #[cfg(target_os = "macos")]
 mod os_impl {
-    // TODO: fill this in.
-    fn get_maps_address(pid: pid_t) -> usize {
+    use failure::Error;
+    use goblin::mach;
+    use proc_maps::*;
+    use libc::pid_t;
+    use regex::Regex;
+    use std::fs::File;
+    use std::io::Read;
+    use std::thread;
+    use std::time;
+    use std::process::{Command, Stdio};
+    use read_process_memory::*;
+
+    // struct to hold everything we know about the program
+    pub struct ProgramInfo {
+        pub pid: pid_t,
+        pub ruby_path: String,
+        pub ruby_offset: usize,
+    }
+
+    pub fn current_thread_address(
+        pid: pid_t,
+        version: &str,
+        is_maybe_thread: Box<Fn(usize, &ProcessHandle, &MapRange, &Vec<MapRange>) -> bool>,
+    ) -> Result<usize, Error> {
+        if version >= "2.5.0" {
+            // TODO: make this more robust
+            let addr = get_symbol_addr2(pid, "_ruby_current_execution_context_ptr");
+            debug!("current_thread_address:_ruby_current_execution_context_ptr: {:?}", addr);
+            addr
+        } else {
+            let addr = get_symbol_addr2(pid, "_ruby_current_thread");
+            debug!("current_thread_address:_ruby_current_thread: {:?}", addr);
+            addr
+        }
+    }
+
+    fn parse_vmmap(pid: pid_t) -> ProgramInfo {
         let vmmap_command = Command::new("vmmap")
             .arg(format!("{}", pid))
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .output()
-            .expect(format!("failed to execute process: {}", e));
+            .expect("failed to execute process");
         if !vmmap_command.status.success() {
             panic!(
                 "failed to execute process: {}",
@@ -37,10 +72,13 @@ mod os_impl {
 
         let output = String::from_utf8(vmmap_command.stdout).unwrap();
 
+        let path_line = output.lines().find(|line| line.starts_with("Path:")).unwrap();
+        // get ruby binary's path
+        let ruby_path = path_line.split_whitespace().last().unwrap();
+
         let lines: Vec<&str> = output
             .split("\n")
-            .filter(|line| line.contains("bin/ruby"))
-            .filter(|line| line.contains("__TEXT"))
+            .filter(|line| line.contains("bin/ruby") && line.contains("__TEXT"))
             .collect();
         let line = lines
             .first()
@@ -48,20 +86,65 @@ mod os_impl {
 
         let re = Regex::new(r"([0-9a-f]+)").unwrap();
         let cap = re.captures(&line).unwrap();
-        let address_str = cap.at(1).unwrap();
+        let address_str = &cap[1];
+        // get address where ruby binary is mapped
         let addr = usize::from_str_radix(address_str, 16).unwrap();
-        debug!("get_maps_address: {:x}", addr);
-        addr
+        debug!("parse_vmmap: {:x}", addr);
+
+        ProgramInfo{
+            pid: pid,
+            ruby_path: ruby_path.to_string(),
+            ruby_offset: addr,
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    fn current_thread_address(pid: pid_t) -> Result<usize, Error> {
-        // TODO: Make this actually look up the `__mh_execute_header` base
-        //   address in the binary via `nm`.
-        let base_address = 0x100000000;
-        let addr = get_nm_address(pid)? + (get_maps_address(pid)? - base_address);
-        debug!("get_ruby_current_thread_address: {:x}", addr);
-        addr
+    pub fn get_ruby_version_address(pid: pid_t) -> Result<usize, Error> {
+        let symbol_name = "_ruby_version";
+        get_symbol_addr(pid, symbol_name)
+    }
+
+    fn get_symbol_addr(pid: pid_t, symbol_name: &str) -> Result<usize, Error> {
+        let proginfo = parse_vmmap(pid);
+        let mut fd = File::open(&proginfo.ruby_path)?;
+        let mut buffer = Vec::new();
+        fd.read_to_end(&mut buffer)?;
+        match mach::MachO::parse(&buffer, 0) {
+            Ok(macho) => {
+                for sym in macho.exports()? {
+                    if sym.name == symbol_name {
+                        debug!("sym: {} {:x}+{:x}", sym.name, sym.offset, proginfo.ruby_offset);
+                        let addr = sym.offset as usize;
+                        return Ok(proginfo.ruby_offset + addr);
+                    }
+                }
+                Err(format_err!("{} is not found", symbol_name))
+            },
+            Err(err) => {
+                Err(format_err!("{}", err))
+            }
+        }
+    }
+
+    fn get_symbol_addr2(pid: pid_t, symbol_name: &str) -> Result<usize, Error> {
+        let proginfo = parse_vmmap(pid);
+        let mut fd = File::open(&proginfo.ruby_path)?;
+        let mut buffer = Vec::new();
+        fd.read_to_end(&mut buffer)?;
+        match mach::MachO::parse(&buffer, 0) {
+            Ok(macho) => {
+                let (s, n) = macho.symbols()
+                    .filter(|x| x.is_ok() )
+                    .map(|x| x.unwrap() )
+                    .find(|&(sym,_)| sym == symbol_name )
+                    .expect("No executable LOAD header found in ELF file. Please report this!");
+                debug!("sym: {} {} {:x}+{:x} {}", s,n.n_strx, n.n_value, proginfo.ruby_offset, n.type_str());
+                let base_address = 0x100000000;
+                Ok(proginfo.ruby_offset + (n.n_value as usize) - base_address)
+            },
+            Err(err) => {
+                Err(format_err!("{}", err))
+            }
+        }
     }
 }
 
